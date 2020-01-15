@@ -1,21 +1,13 @@
 import keras
 import numpy as np
-import resnet
 from net_keras import Net
 import os
-import glob
-import time
-import click
 import pickle
-import h5py
-from scipy import io as spio
-from losses import qwk_loss, make_cost_matrix
+from losses import qwk_loss, make_cost_matrix, ms_n_qwk_loss
 from metrics import np_quadratic_weighted_kappa, top_2_accuracy, top_3_accuracy, \
 	minimum_sensitivity, accuracy_off1
-from dataset import Dataset
+from dataset2 import Dataset
 from sklearn.metrics import confusion_matrix
-import math
-import gc
 from keras import backend as K
 
 class Experiment:
@@ -23,10 +15,12 @@ class Experiment:
 	Class that represents a single experiment that can be run and evaluated.
 	"""
 
-	def __init__(self, name='unnamed', db='100', net_type='vgg19', batch_size=128, epochs=100,
+	def __init__(self, name='unnamed', db='cifar10', net_type='vgg19', batch_size=128, epochs=100,
 				 checkpoint_dir='checkpoint', loss='categorical_crossentropy', activation='relu',
-				 final_activation='softmax', f_a_params = {}, use_tau=True, spp_alpha=1.0, lr=0.1, momentum=0.9, dropout=0, task='both', workers=4,
-				 queue_size=1024, val_metrics=['loss', 'acc'], rescale_factor=0, augmentation={}):
+				 final_activation='softmax', f_a_params = {}, use_tau=True,
+				 prob_layer=None, spp_alpha=1.0, lr=0.1, momentum=0.9, dropout=0, task='both', workers=4,
+				 queue_size=1024, val_metrics=['loss', 'acc'], rescale_factor=0, augmentation={},
+				 val_type='holdout', holdout=0.2, n_folds=5):
 		self._name = name
 		self._db = db
 		self._net_type = net_type
@@ -38,6 +32,7 @@ class Experiment:
 		self._use_tau = use_tau
 		self._final_activation = final_activation
 		self._f_a_params = f_a_params
+		self._prob_layer = prob_layer
 		self._spp_alpha = spp_alpha
 		self._lr = lr
 		self._momentum = momentum
@@ -49,8 +44,14 @@ class Experiment:
 		self._val_metrics = val_metrics
 		self._rescale_factor = rescale_factor
 		self._augmentation = augmentation
+		self._val_type = val_type
+		self._holdout = holdout
+		self._n_folds = n_folds
+		self._current_fold = 0
 
 		self._best_metric = None
+
+		self._ds = None
 
 		# Model and results file names
 		self.model_file = 'model.h5'
@@ -71,9 +72,10 @@ class Experiment:
 		Get experiment auto-generated name based on experiment parameters.
 		:return: experiment auto-generated name.
 		"""
-		return "{}_{}_{}_{}_{}_{}_{}_{}_{}_{}".format(self.db, self.net_type, self.batch_size, self.activation,
+		return "{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}".format(self.db, self.net_type, self.batch_size, self.activation,
 														 self.loss,
 														 self.final_activation,
+														 self.prob_layer and self.prob_layer or '',
 														 self.spp_alpha, self.lr,
 														 self.momentum, self.dropout)
 
@@ -212,6 +214,18 @@ class Experiment:
 		del self._use_tau
 
 	@property
+	def prob_layer(self):
+		return self._prob_layer
+
+	@prob_layer.setter
+	def prob_layer(self, prob_layer):
+		self._prob_layer = prob_layer
+
+	@prob_layer.deleter
+	def prob_layer(self):
+		del self._prob_layer
+
+	@property
 	def spp_alpha(self):
 		return self._spp_alpha
 
@@ -347,6 +361,14 @@ class Experiment:
 	def best_metric(self):
 		return self._best_metric
 
+	@property
+	def current_fold(self):
+		return self._current_fold
+
+	@current_fold.setter
+	def current_fold(self, current_fold):
+		self._current_fold = current_fold
+
 	def new_metric(self, metric, maximize=False):
 		"""
 		Updates best metric if metric provided is better than the best metric stored.
@@ -370,9 +392,6 @@ class Experiment:
 
 		print('=== RUNNING {} ==='.format(self.name))
 
-		# Garbage collection
-		gc.collect()
-
 		# Initial epoch. 0 by default
 		start_epoch = 0
 
@@ -387,75 +406,22 @@ class Experiment:
 			print("Training already finished. Skipping...")
 			return
 
-		# Train data generator
-		train_datagen = keras.preprocessing.image.ImageDataGenerator(
-			rescale=self.rescale_factor,
-			**self.augmentation
-		)
-
-		# Augmentation for validation / test
-		eval_augmentation = {k: v for k, v in self.augmentation.items() if
-							 k == 'featurewise_center' or k == 'featurewise_std_normalization'}
-
-		# Validation data generator
-		val_datagen = keras.preprocessing.image.ImageDataGenerator(rescale=self.rescale_factor, **eval_augmentation)
-
-		# Get database paths
-		train_path, val_path, _ = self.get_db_path(self.db)
-
-		# Check that database exists and paths are correct
-		if train_path == '' or val_path == '':
-			raise Exception('Invalid database. Choose one of: Retinopathy or Adience.')
-
-		# Load datasets
-		ds_train = Dataset(train_path)
-		# ds_train.standardize_data()
-		ds_val = Dataset(val_path)
-		# ds_val.standardize_data()
-
-		# Get dataset details
-		num_classes = ds_train.num_classes
-		num_channels = ds_train.num_channels
-		img_size = ds_train.img_size
-
-		# Fit for zca_whitening, featurewise_center, featurewise_std_normalization
-		if 'zca_whitening' in self.augmentation or 'featurewise_center' in self.augmentation or 'featurewise_std_normalization' in self.augmentation:
-			train_datagen.fit(ds_train.x)
-			val_datagen.mean = train_datagen.mean
-			val_datagen.std = train_datagen.std
-
-		# Train data generator used for training
-		train_generator = train_datagen.flow(
-			ds_train.x,
-			ds_train.y,
-			batch_size=self.batch_size
-		)
-
-		# Validation generator
-		val_generator = val_datagen.flow(
-			ds_val.x,
-			ds_val.y,
-			batch_size=self.batch_size,
-			shuffle=True
-		)
-
-		# Calculate the number of steps per epoch
-		steps = (len(ds_train.y) * 1) // self.batch_size
-		steps_val = ds_val.num_batches(self.batch_size)
 
 		# Get class weights based on frequency
-		class_weight = ds_train.get_class_weights()
-
-		# Free dataset object
-		del ds_train
-		del ds_val
-		gc.collect()
+		class_weight = self._ds.get_class_weights()
+		# class_weight = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 100000.0])
 
 		# Learning rate scheduler callback
-		def learning_rate_scheduler(epoch):
-			lr = self.lr * np.exp(-0.01 * epoch)
+		def lr_exp_scheduler(epoch):
+			lr = self.lr * np.exp(-0.025 * epoch)
+			# print("New LR: {}".format(lr))
 
 			return lr
+
+		lr_drop = 20
+		def lr_scheduler(epoch):
+			return self.lr * (0.5 ** (epoch // lr_drop))
+
 
 		# Save epoch callback for training process
 		def save_epoch(epoch, logs):
@@ -469,16 +435,14 @@ class Experiment:
 				f.write('\n' + str(self.best_metric))
 
 
-		save_epoch_callback = keras.callbacks.LambdaCallback(
-			on_epoch_end=save_epoch
-		)
+		save_epoch_callback = keras.callbacks.LambdaCallback(on_epoch_end=save_epoch)
 
 		# NNet object
-		net_object = Net(img_size, self.activation, self.final_activation, self.f_a_params, self.use_tau, num_channels, num_classes,
-						 self.spp_alpha,
-						 self.dropout)
+		net_object = Net(self._ds.img_size, self.activation, self.final_activation, self.f_a_params, self.use_tau,
+						 self.prob_layer, self._ds.num_channels, self._ds.num_classes, self.spp_alpha, self.dropout)
 
-		model = self.get_model(net_object, self.net_type)
+		# model = self.get_model(net_object, self.net_type)
+		model = net_object.build(self.net_type)
 
 		# Create checkpoint dir if not exists
 		if not os.path.isdir(self.checkpoint_dir):
@@ -488,9 +452,12 @@ class Experiment:
 		if os.path.isfile(os.path.join(self.checkpoint_dir, self.model_file)):
 			print("===== RESTORING SAVED MODEL =====")
 			model.load_weights(os.path.join(self.checkpoint_dir, self.model_file))
+		elif os.path.isfile(os.path.join(self.checkpoint_dir, self.best_model_file)):
+			print("===== RESTORING SAVED BEST MODEL =====")
+			model.load_weights(os.path.join(self.checkpoint_dir, self.best_model_file))
 
 		# Create the cost matrix that will be used to compute qwk
-		cost_matrix = K.constant(make_cost_matrix(num_classes), dtype=K.floatx())
+		cost_matrix = K.constant(make_cost_matrix(self._ds.num_classes), dtype=K.floatx())
 
 		# Cross-entropy loss by default
 		loss = 'categorical_crossentropy'
@@ -498,40 +465,51 @@ class Experiment:
 		# Quadratic Weighted Kappa loss
 		if self.loss == 'qwk':
 			loss = qwk_loss(cost_matrix)
+		elif self.loss == 'msqwk':
+			loss = ms_n_qwk_loss(cost_matrix)
 
 		# Only accuracy for training.
 		# Computing QWK for training properly is too expensive
 		metrics = ['accuracy']
 
+		lr_decay = 1e-6
+
 		# Compile the keras model
 		model.compile(
-			optimizer=keras.optimizers.Adam(lr=self.lr),  # keras.optimizers.SGD(self.lr, 0.9),
-			loss=loss,
-			metrics=metrics
+			optimizer = keras.optimizers.SGD(lr=self.lr, decay=lr_decay, momentum=0.9, nesterov=True),
+			# keras.optimizers.SGD(lr=self.lr, decay=lr_decay, momentum=0.9, nesterov=True),
+			# keras.optimizers.Adam(lr=self.lr, decay=lr_decay),
+			loss=loss, metrics=metrics
 		)
 
 		# Print model summary
 		model.summary()
 
+		print(F'Training on {self._ds.size_train()} samples, validating on {self._ds.size_val()} samples.')
+
 		# Run training
-		model.fit_generator(train_generator, epochs=self.epochs,
+		model.fit_generator(self._ds.generate_train(self.batch_size, self.augmentation), epochs=self.epochs,
 							initial_epoch=start_epoch,
-							steps_per_epoch=steps,
-							callbacks=[keras.callbacks.LearningRateScheduler(learning_rate_scheduler),
+							steps_per_epoch=self._ds.num_batches_train(self.batch_size),
+							callbacks=[keras.callbacks.LearningRateScheduler(lr_scheduler),
+									   #keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=25, mode='min', min_lr=1e-4, verbose=1),
 									   keras.callbacks.ModelCheckpoint(
 										   os.path.join(self.checkpoint_dir, self.model_file)),
 									   save_epoch_callback,
 									   keras.callbacks.CSVLogger(os.path.join(self.checkpoint_dir, self.csv_file),
 																	append=True),
 									   keras.callbacks.TensorBoard(log_dir=self.checkpoint_dir),
-									   keras.callbacks.TerminateOnNaN(),
+									   # keras.callbacks.TerminateOnNaN(),
+									   keras.callbacks.EarlyStopping(min_delta=0.0005, patience=40, verbose=1),
+									   # PrintWeightsCallback(class_weight),
+									   # ReweightClassesCallback(val_generator=val_generator, val_steps=steps_val, class_weights=class_weight)
 									   ],
 							workers=self.workers,
 							use_multiprocessing=False,
 							max_queue_size=self.queue_size,
 							class_weight=class_weight,
-							validation_data=val_generator,
-							validation_steps=steps_val,
+							validation_data=self._ds.generate_val(self.batch_size),
+							validation_steps=self._ds.num_batches_val(self.batch_size),
 							verbose=2
 							)
 
@@ -543,13 +521,11 @@ class Experiment:
 			f.write(str(self.epochs))
 			f.write('\n' + str(self.best_metric))
 
-		# Free objects
-		del model
-		del cost_matrix
-		del train_datagen
-		del train_generator
-		del val_datagen
-		del val_generator
+		# Delete model file
+		if os.path.isfile(os.path.join(self.checkpoint_dir, self.model_file)):
+			os.remove(os.path.join(self.checkpoint_dir, self.model_file))
+
+
 
 	def evaluate(self):
 		"""
@@ -557,9 +533,6 @@ class Experiment:
 		:return: None
 		"""
 		print('=== EVALUATING {} ==='.format(self.name))
-
-		# Garbage collection
-		gc.collect()
 
 		# Check if best model file exists
 		if not os.path.isfile(os.path.join(self.checkpoint_dir, self.best_model_file)):
@@ -571,82 +544,38 @@ class Experiment:
 			print('Model already evaluated')
 			return
 
-		paths = self.get_db_path(self.db)
-
 		all_metrics = {}
 
-		# Augmentation for validation / test
-		eval_augmentation = {k: v for k, v in self.augmentation.items() if
-							 k == 'featurewise_center' or k == 'featurewise_std_normalization'}
+		# Get the generators for train, validation and test
+		generators = [self._ds.generate_train(self.batch_size, {}), self._ds.generate_val(self.batch_size), self._ds.generate_test(self.batch_size)]
+		steps = [self._ds.num_batches_train(self.batch_size), self._ds.num_batches_val(self.batch_size), self._ds.num_batches_test(self.batch_size)]
 
-		mean = 0
-		std = 0
-
-		for path, set in zip(paths, ['Train', 'Validation', 'Test']):
+		for generator, step, set in zip(generators, steps, ['Train', 'Validation', 'Test']):
 			print('\n=== {} dataset ===\n'.format(set))
 
-			# Load test dataset
-			ds_test = Dataset(path)
-			# ds_test.standardize_data()
-
-			# Get dataset details
-			num_classes = ds_test.num_classes
-			num_channels = ds_test.num_channels
-			img_size = ds_test.img_size
-
-			# Validation data generator
-			test_datagen = keras.preprocessing.image.ImageDataGenerator(rescale=self.rescale_factor,
-																		   **eval_augmentation)
-
-			# Save mean and std of train set
-			if set == 'Train':
-				# Fit for zca_whitening, featurewise_center, featurewise_std_normalization
-				if 'zca_whitening' in self.augmentation or 'featurewise_center' in self.augmentation or 'featurewise_std_normalization' in self.augmentation:
-					test_datagen.fit(ds_test.x)
-					mean = test_datagen.mean
-					std = test_datagen.std
-			else:
-				if 'zca_whitening' in self.augmentation or 'featurewise_center' in self.augmentation or 'featurewise_std_normalization' in self.augmentation:
-					test_datagen.mean = mean
-					test_datagen.std = std
-
-			# Test generator
-			test_generator = test_datagen.flow(
-				ds_test.x,
-				ds_test.y,
-				batch_size=self.batch_size,
-				shuffle=False
-			)
-
 			# NNet object
-			net_object = Net(img_size, self.activation, self.final_activation, self.f_a_params, self.use_tau, num_channels,
-							 num_classes,
-							 self.spp_alpha,
-							 self.dropout)
+			net_object = Net(self._ds.img_size, self.activation, self.final_activation, self.f_a_params, self.use_tau,
+							 self.prob_layer, self._ds.num_channels, self._ds.num_classes, self.spp_alpha, self.dropout)
 
-			model = self.get_model(net_object, self.net_type)
+			# model = self.get_model(net_object, self.net_type)
+			model = net_object.build(self.net_type)
 
-			# Restore weights
+			# Load weights
 			model.load_weights(os.path.join(self.checkpoint_dir, self.best_model_file))
 
 			# Get predictions
-			test_generator.reset()
-			predictions = model.predict_generator(test_generator, verbose=1)
+			# generator.reset()
+			predictions = model.predict_generator(generator, steps=step, verbose=1)
 
-			metrics = self.compute_metrics(ds_test.y, predictions, num_classes)
+			# generator.reset()
+			y_set = None
+			for x, y in generator:
+				y_set = np.array(y) if y_set is None else np.vstack((y_set, y))				
+				
+			metrics = self.compute_metrics(y_set, predictions, self._ds.num_classes)
 			self.print_metrics(metrics)
 
 			all_metrics[set] = metrics
-
-			# Free objects
-			del ds_test
-			del test_datagen
-			del test_generator
-			del net_object
-			del model
-			del predictions
-			del metrics
-			gc.collect()
 
 		with open(os.path.join(self.checkpoint_dir, self.evaluation_file), 'wb') as f:
 			pickle.dump({'config': self.get_config(), 'metrics': all_metrics}, f)
@@ -658,6 +587,7 @@ class Experiment:
 										  num_classes - 1)
 		ms = minimum_sensitivity(y_true, y_pred)
 		mae = sess.run(K.mean(keras.losses.mean_absolute_error(y_true, y_pred)))
+		omae = sess.run(K.mean(keras.losses.mean_absolute_error(K.argmax(y_true), K.argmax(y_pred))))
 		mse = sess.run(K.mean(keras.losses.mean_squared_error(y_true, y_pred)))
 		acc = sess.run(K.mean(keras.metrics.categorical_accuracy(y_true, y_pred)))
 		top2 = sess.run(top_2_accuracy(y_true, y_pred))
@@ -669,6 +599,7 @@ class Experiment:
 			'QWK': qwk,
 			'MS': ms,
 			'MAE': mae,
+			'OMAE': omae,
 			'MSE': mse,
 			'CCR': acc,
 			'Top-2': top2,
@@ -687,31 +618,10 @@ class Experiment:
 		print('Top-3: {:.4f}'.format(metrics['Top-3']))
 		print('1-off: {:.4f}'.format(metrics['1-off']))
 		print('MAE: {:.4f}'.format(metrics['MAE']))
+		print('OMAE: {:.4f}'.format(metrics['OMAE']))
 		print('MSE: {:.4f}'.format(metrics['MSE']))
 		print('MS: {:.4f}'.format(metrics['MS']))
 
-	def get_model(self, net_object, name):
-		if name == 'conv128':
-			model = net_object.conv128()
-		elif name == 'beckhamresnet':
-			model = net_object.beckham_resnet()
-		else:
-			raise Exception('Invalid net type. You must select one of these: vgg19, conv128')
-
-		return model
-
-	def get_db_path(self, db):
-		"""
-		Get dataset path for train, validation and test for a given database name.
-		:param db: database name.
-		:return: train path, validation path, test path.
-		"""
-		if db.lower() == 'retinopathy':
-			return "../../retinopathy/128/train", "../../retinopathy/128/val", "../../retinopathy/128/test"
-		elif db.lower() == 'adience':
-			return "../../adience/adience_train_256.h5", "../../adience/adience_val_256.h5", "../../adience/adience_test_256.h5"
-		else:
-			return "", "", ""
 
 	def get_config(self):
 		"""
@@ -725,6 +635,7 @@ class Experiment:
 			'batch_size': self.batch_size,
 			'epochs': self.epochs,
 			'checkpoint_dir': self.checkpoint_dir,
+			'prob_layer': self.prob_layer,
 			'loss': self.loss,
 			'activation': self.activation,
 			'use_tau' : self.use_tau,
@@ -739,7 +650,10 @@ class Experiment:
 			'queue_size': self.queue_size,
 			'val_metrics': self.val_metrics,
 			'rescale_factor': self.rescale_factor,
-			'augmentation': self.augmentation
+			'augmentation': self.augmentation,
+			'val_type' : self._val_type,
+			'holdout' : self._holdout,
+			'n_folds' : self._n_folds
 		}
 
 	def set_config(self, config):
@@ -748,9 +662,9 @@ class Experiment:
 		:param config: config dictionary.
 		:return: None
 		"""
-		self.db = 'db' in config and config['db'] or '10'
+		self.db = 'db' in config and config['db'] or 'cifar10'
 		self.net_type = 'net_type' in config and config['net_type'] or 'vgg19'
-		self.batch_size = 'batch_size' in config and config['batch_size'] or 128
+		self.batch_size = 'batch_size' in config and int(config['batch_size']) or 128
 		self.epochs = 'epochs' in config and config['epochs'] or 100
 		self.checkpoint_dir = 'checkpoint_dir' in config and config['checkpoint_dir'] or 'results'
 		self.loss = 'loss' in config and config['loss'] or 'crossentropy'
@@ -758,6 +672,7 @@ class Experiment:
 		self.final_activation = 'final_activation' in config and config['final_activation'] or 'softmax'
 		self.f_a_params = config['f_a_params'] if 'f_a_params' in config else {}
 		self.use_tau = config['use_tau'] if 'use_tau' in config and config['use_tau'] else False
+		self.prob_layer = 'prob_layer' in config and config['prob_layer'] or None
 		self.spp_alpha = 'spp_alpha' in config and config['spp_alpha'] or 0
 		self.lr = 'lr' in config and config['lr'] or 0.1
 		self.momentum = 'momentum' in config and config['momentum'] or 0
@@ -768,11 +683,34 @@ class Experiment:
 		self.val_metrics = 'val_metrics' in config and config['val_metrics'] or ['acc', 'loss']
 		self.rescale_factor = 'rescale_factor' in config and config['rescale_factor'] or 0
 		self.augmentation = 'augmentation' in config and config['augmentation'] or {}
+		self._val_type = 'val_type' in config and config['val_type'] or 'holdout'
+		self._holdout = 'holdout' in config and float(config['holdout']) or 0.2
+		self._n_folds = 'n_folds' in config and int(config['n_folds']) or 5
 
 		if 'name' in config:
 			self.name = config['name']
 		else:
 			self.set_auto_name()
+
+		
+		# Load dataset
+		self._ds = Dataset(self._db)
+
+		self._setup_validation()
+
+	def _setup_validation(self):
+		if self._ds is None:
+			raise Exception('Cannot setup validation because dataset is not loaded')
+			
+		# Validation config
+		if self._val_type == 'kfold':
+			self._ds.n_folds = self._n_folds
+			self._ds.set_fold(self._current_fold)
+		elif self._val_type == 'holdout':
+			self._ds.n_folds = 1 # 1 fold means holdout
+			self._ds.holdout = self._holdout
+		else:
+			raise Exception('{} is not a valid validation type.'.format(self._val_type))
 
 	def save_to_file(self, path):
 		"""

@@ -54,3 +54,29 @@ def qwk_loss(cost_matrix):
 		return numerator / denominator # + K.cast(K.sum(conf_mat) * 0, dtype=K.floatx())
 
 	return _qwk_loss
+
+
+def _compute_sensitivities(y_true, y_pred):
+	diff = (1.0 - K.pow(y_true - y_pred, 2)) / 2.0 # [0,1]
+	diff_class = K.sum(diff, axis=1) # vector of size N
+	sum = K.sum(diff_class) # total sum of that vector
+	sensitivities = diff_class / sum
+
+	return sensitivities
+
+
+def ms_loss(true_prob, pred_prob):
+	print(true_prob)
+	sensis = _compute_sensitivities(true_prob, pred_prob)
+	mean_sens = K.mean(sensis)
+	return mean_sens
+
+
+def ms_n_qwk_loss(qwk_cost_matrix, alpha=0.5):
+	def _ms_n_qwk_loss(true_prob, pred_prob):
+		qwk = qwk_loss(qwk_cost_matrix)(true_prob, pred_prob)
+		ms = ms_loss(true_prob, pred_prob)
+
+		return alpha * qwk + (1 - alpha) * ms
+
+	return _ms_n_qwk_loss

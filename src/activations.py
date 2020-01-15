@@ -3,6 +3,354 @@ import keras
 from tensorflow import distributions, matrix_band_part, igamma, lgamma
 from keras import backend as K
 
+def cons_greater_zero(value):
+	epsilon = 1e-9
+	return epsilon + K.pow(value, 2)
+
+class SPP(keras.layers.Layer):
+	"""
+	Parametric softplus activation layer.
+	"""
+
+	def __init__(self, alpha, **kwargs):
+		super(SPP, self).__init__(**kwargs)
+		self.__name__ = 'SPP'
+		self.alpha = alpha
+
+	def build(self, input_shape):
+		super(SPP, self).build(input_shape)
+
+	def call(self, inputs, **kwargs):
+		return K.softplus(inputs) - self.alpha
+
+	def compute_output_shape(self, input_shape):
+		return input_shape
+
+class SPPT(keras.layers.Layer):
+	"""
+	Trainable Parametric softplus activation layer.
+	"""
+
+	def __init__(self, **kwargs):
+		super(SPPT, self).__init__(**kwargs)
+		self.__name__ = 'SPP'
+
+	def build(self, input_shape):
+		self.alpha = self.add_weight(name='alpha', shape=(1,), dtype=K.floatx(),
+									 initializer=keras.initializers.RandomUniform(minval=0, maxval=1),
+									 trainable=True)
+
+		super(SPPT, self).build(input_shape)
+
+	def call(self, inputs, **kwargs):
+		return K.softplus(inputs) - self.alpha
+
+	def compute_output_shape(self, input_shape):
+		return input_shape
+
+
+def parametric_softplus(spp_alpha):
+	"""
+	Compute parametric softplus function with given alpha.
+	:param spp_alpha: alpha parameter for softplus function.
+	:return: parametric softplus activation value.
+	"""
+
+	def spp(x):
+		return K.log(1 + K.exp(x)) - spp_alpha
+
+	return spp
+
+
+class MPELU(keras.layers.Layer):
+	def __init__(self, channel_wise=True, **kwargs):
+		super(MPELU, self).__init__(**kwargs)
+		self.channel_wise = channel_wise
+
+	def build(self, input_shape):
+		shape = [1]
+
+		if self.channel_wise:
+			shape = [int(input_shape[-1])]  # Number of channels
+
+		self.alpha = self.add_weight(name='alpha', shape=shape, dtype=K.floatx(),
+									 initializer=keras.initializers.RandomUniform(minval=-1, maxval=1),
+									 trainable=True)
+		self.beta = self.add_weight(name='beta', shape=shape, dtype=K.floatx(),
+									initializer=keras.initializers.RandomUniform(minval=0.0, maxval=1),
+									trainable=True)
+
+		# Finish buildidng
+		super(MPELU, self).build(input_shape)
+
+	def call(self, inputs, **kwargs):
+		positive = keras.activations.relu(inputs)
+		negative = self.alpha * (K.exp(-keras.activations.relu(-inputs) * cons_greater_zero(self.beta)) - 1)
+
+		return positive + negative
+
+	def compute_output_shape(self, input_shape):
+		return input_shape
+
+
+class RTReLU(keras.layers.Layer):
+	def __init__(self, **kwargs):
+		super(RTReLU, self).__init__(**kwargs)
+
+	def build(self, input_shape):
+		shape = [int(input_shape[-1])]  # Number of channels
+
+		self.a = self.add_weight(name='a', shape=shape, dtype=K.floatx(),
+								 initializer=keras.initializers.RandomUniform(minval=-1, maxval=1),
+								 trainable=False)
+
+		# Finish building
+		super(RTReLU, self).build(input_shape)
+
+	def call(self, inputs, **kwargs):
+		return keras.activations.relu(inputs + self.a)
+
+	def compute_output_shape(self, input_shape):
+		return input_shape
+
+
+class RTPReLU(keras.layers.PReLU):
+	def __init__(self, **kwargs):
+		super(RTPReLU, self).__init__(**kwargs)
+
+	def build(self, input_shape):
+		shape = [int(input_shape[-1])]  # Number of channels
+
+		self.a = self.add_weight(name='a', shape=shape, dtype=K.floatx(),
+								 initializer=keras.initializers.RandomUniform(minval=-1, maxval=1),
+								 trainable=False)
+
+		# Call PReLU build method
+		super(RTPReLU, self).build(input_shape)
+
+	def call(self, inputs, **kwargs):
+		pos = keras.activations.relu(inputs + self.a)
+		neg = -self.alpha * keras.activations.relu(-(inputs * self.a))
+
+		return pos + neg
+
+
+class PairedReLU(keras.layers.Layer):
+	def __init__(self, scale=0.5, **kwargs):
+		super(PairedReLU, self).__init__(**kwargs)
+		self.scale = scale
+
+	def build(self, input_shape):
+		self.theta = self.add_weight(name='theta', shape=[1], dtype=K.floatx(),
+									 initializer=keras.initializers.RandomUniform(minval=-1, maxval=1),
+									 trainable=True)
+		self.theta_p = self.add_weight(name='theta_p', shape=[1], dtype=K.floatx(),
+									   initializer=keras.initializers.RandomUniform(minval=-1, maxval=1),
+									   trainable=True)
+
+		# Finish building
+		super(PairedReLU, self).build(input_shape)
+
+	def call(self, inputs, **kwargs):
+		return K.concatenate(
+			(keras.activations.relu(self.scale * inputs - self.theta), keras.activations.relu(-self.scale * inputs - self.theta_p)),
+			axis=len(inputs.get_shape()) - 1)
+
+	def compute_output_shape(self, input_shape):
+		shape = list(input_shape)
+		shape[-1]  = shape[-1] * 2
+		shape = tuple(shape)
+		return shape
+
+
+class EReLU(keras.layers.Layer):
+	def __init__(self, alpha=0.5, **kwargs):
+		super(EReLU, self).__init__(**kwargs)
+		self.alpha = alpha
+
+	def build(self, input_shape):
+		# shape = input_shape[1:]
+
+		# self.k = self.add_weight(name='k', shape=shape, dtype=K.floatx(),
+		# 						 initializer=keras.initializers.RandomUniform(minval=1 - self.alpha, maxval=1 + self.alpha), trainable=False)
+
+		# Finish building
+		super(EReLU, self).build(input_shape)
+
+	def call(self, inputs, **kwargs):
+		# Generate random uniform tensor between [1-alpha, 1+alpha] for training and ones tensor for test (ReLU)
+		k = K.in_train_phase(K.random_uniform(inputs.shape[1:], 1 - self.alpha, 1 + self.alpha), K.ones(inputs.shape[1:]))
+
+		return keras.activations.relu(inputs * k)
+
+	def compute_output_shape(self, input_shape):
+		return input_shape
+
+
+class EPReLU(keras.layers.Layer):
+	def __init__(self, alpha=0.5, **kwargs):
+		super(EPReLU, self).__init__(**kwargs)
+		self.alpha = alpha
+
+	def build(self, input_shape):
+		# Trainable (PReLU) parameter
+		self.a = self.add_weight(name='a', shape=input_shape[1:], dtype=K.floatx(), initializer=keras.initializers.RandomUniform(0.0, 1.0))
+
+		# Finish building
+		super(EPReLU, self).build(input_shape)
+
+	def call(self, inputs, **kwargs):
+		# Generate random uniform tensor between [1-alpha, 1+alpha] for training and ones tensor for test
+		k = K.in_train_phase(K.random_uniform(inputs.shape[1:], 1 - self.alpha, 1 + self.alpha),
+							 K.ones(inputs.shape[1:]))
+
+		pos = keras.activations.relu(inputs) * k
+		neg = -self.a * keras.activations.relu(-inputs)
+
+		return pos + neg
+
+
+class SQRTActivation(keras.layers.Layer):
+	def __init__(self, **kwargs):
+		super(SQRTActivation, self).__init__(**kwargs)
+
+	def build(self, input_shape):
+		super(SQRTActivation, self).build(input_shape)
+
+	def call(self, inputs, **kwargs):
+		pos = K.sqrt(keras.activations.relu(inputs))
+		neg = - K.sqrt(keras.activations.relu(-inputs))
+
+		return pos + neg
+
+
+# Randomized Leaky Rectified Linear Unit
+class RReLu(keras.layers.Layer):
+	def __init__(self, **kwargs):
+		super(RReLu, self).__init__(**kwargs)
+
+	def build(self, input_shape):
+		# self.alpha = self.add_weight(name='alpha', shape=input_shape[1:], dtype=K.floatx(),
+		#							 initializer=keras.initializers.RandomUniform(minval=0.0, maxval=1.0))
+
+		super(RReLu, self).build(input_shape)
+
+	def call(self, inputs, **kwargs):
+		# Generate random uniform alpha
+		alpha = K.in_train_phase(K.random_uniform(inputs.shape[1:], 0.0, 1.0), K.constant((0.0+1.0)/2.0, shape=inputs.shape[1:]))
+
+		pos = keras.activations.relu(inputs)
+		neg = alpha * keras.activations.relu(-inputs)
+
+		return pos + neg
+
+
+class PELU(keras.layers.Layer):
+	def __init__(self, **kwargs):
+		super(PELU, self).__init__(**kwargs)
+
+	def build(self, input_shape):
+		self.alpha = self.add_weight(name='alpha', shape=(1,), dtype=K.floatx(),
+									 initializer=keras.initializers.RandomUniform(minval=0.0, maxval=1))
+		# self.alpha = K.clip(self.alpha, 0.0001, 10)
+
+		self.beta = self.add_weight(name='beta', shape=(1,), dtype=K.floatx(),
+									initializer=keras.initializers.RandomUniform(minval=0.0, maxval=1))
+		# self.beta = K.clip(self.beta, 0.0001, 10)
+
+		super(PELU, self).build(input_shape)
+
+	def call(self, inputs, **kwargs):
+		pos = (cons_greater_zero(self.alpha) / cons_greater_zero(self.beta)) * keras.activations.relu(inputs)
+		neg = cons_greater_zero(self.alpha) * (K.exp((-keras.activations.relu(-inputs)) / cons_greater_zero(self.beta)) - 1)
+
+		return pos + neg
+
+
+class SlopedReLU(keras.layers.Layer):
+	def __init__(self, **kwargs):
+		super(SlopedReLU, self).__init__(**kwargs)
+
+	def build(self, input_shape):
+		self.alpha = self.add_weight(name='alpha', shape=(1,), dtype=K.floatx(),
+									 initializer=keras.initializers.RandomUniform(minval=1.0, maxval=10.0))
+		self.alpha = K.clip(self.alpha, 1.0, 10)
+
+		super(SlopedReLU, self).build(input_shape)
+
+	def call(self, inputs, **kwargs):
+		return keras.activations.relu(self.alpha * inputs)
+
+
+class PTELU(keras.layers.Layer):
+	def __init__(self, **kwargs):
+		super(PTELU, self).__init__(**kwargs)
+
+	def build(self, input_shape):
+		self.alpha = self.add_weight(name='alpha', shape=(1,), dtype=K.floatx(),
+									 initializer=keras.initializers.RandomUniform(minval=0.01, maxval=1))
+		self.alpha = K.clip(self.alpha, 0.0001, 100)
+
+		self.beta = self.add_weight(name='beta', shape=(1,), dtype=K.floatx(),
+									initializer=keras.initializers.RandomUniform(minval=0.01, maxval=1))
+		self.beta = K.clip(self.beta, 0.0001, 100)
+
+		super(PTELU, self).build(input_shape)
+
+	def call(self, inputs, **kwargs):
+		pos = keras.activations.relu(inputs)
+		neg = self.alpha * K.tanh(- self.beta * keras.activations.relu(-inputs))
+
+		return pos + neg
+
+
+class Antirectifier(keras.layers.Layer):
+	'''This is the combination of a sample-wise
+	L2 normalization with the concatenation of the
+	positive part of the input with the negative part
+	of the input. The result is a tensor of samples that are
+	twice as large as the input samples.
+	It can be used in place of a ReLU.
+	# Input shape
+		2D tensor of shape (samples, n)
+	# Output shape
+		2D tensor of shape (samples, 2*n)
+	# Theoretical justification
+		When applying ReLU, assuming that the distribution
+		of the previous output is approximately centered around 0.,
+		you are discarding half of your input. This is inefficient.
+		Antirectifier allows to return all-positive outputs like ReLU,
+		without discarding any data.
+		Tests on MNIST show that Antirectifier allows to train networks
+		with twice less parameters yet with comparable
+		classification accuracy as an equivalent ReLU-based network.
+	'''
+
+	def compute_output_shape(self, input_shape):
+		shape = list(input_shape)
+		assert len(shape) == 2  # only valid for 2D tensors
+		shape[-1] *= 2
+		return tuple(shape)
+
+	def call(self, inputs, **kwargs):
+		inputs -= K.mean(inputs, axis=1, keepdims=True)
+		inputs = K.l2_normalize(inputs, axis=1)
+		pos = K.relu(inputs)
+		neg = K.relu(-inputs)
+		return K.concatenate([pos, neg], axis=1)
+
+
+class CReLU(keras.layers.Layer):
+	def compute_output_shape(self, input_shape):
+		shape = list(input_shape)
+		shape[-1] *= 2
+		return tuple(shape)
+
+	def call(self, inputs, **kwargs):
+		pos = K.relu(inputs)
+		neg = K.relu(-inputs)
+		return K.concatenate([pos, neg])
+
 class CLM(keras.layers.Layer):
 	"""
 	Proportional Odds Model activation layer.
@@ -131,7 +479,7 @@ class CLM(keras.layers.Layer):
 			self.__set_default_param('p', self.add_weight('p_clm', shape=(1,), initializer=keras.initializers.Constant(0.5)))
 
 
-	def call(self, x):
+	def call(self, x, **kwargs):
 		thresholds = self._convert_thresholds(self.thresholds_b, self.thresholds_a)
 		return self._nnpom(x, thresholds)
 
